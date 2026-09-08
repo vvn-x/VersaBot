@@ -114,6 +114,28 @@ def get_and_delete_sub(user_id, guild_id, role_id):
         return row
 
 
+def get_sub(user_id, guild_id, role_id):
+    """يرجع بيانات اشتراك واحد محدد (بدون حذفه) - تُستخدم لأوامر التجديد وزيادة الأيام."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT end_date, dm_message_id, log_message_id, start_date FROM subs '
+            'WHERE user_id = %s AND guild_id = %s AND role_id = %s',
+            (user_id, guild_id, role_id)
+        )
+        return cursor.fetchone()
+
+
+def update_sub_end_date(user_id, guild_id, role_id, new_end_date_str):
+    """يحدّث تاريخ انتهاء اشتراك موجود فقط (تجديد أو تصحيح مدة) بدون لمس بقية بياناته."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE subs SET end_date = %s WHERE user_id = %s AND guild_id = %s AND role_id = %s',
+            (new_end_date_str, user_id, guild_id, role_id)
+        )
+
+
 def get_guild_subs(guild_id):
     with get_connection() as conn:
         cursor = conn.cursor()
