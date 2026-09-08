@@ -62,6 +62,53 @@ class AddMemberSelect(discord.ui.UserSelect):
         await interaction.followup.send(msg, ephemeral=True)
 
 
+class RoleChooserSelect(discord.ui.Select):
+    """قائمة اختيار تظهر فقط عند امتلاك المستخدم أكثر من رتبة اشتراك فعالة،
+    حتى يحدد الرتبة التي يقصدها قبل تنفيذ الإجراء (إضافة/إزالة عضو، تعديل...)."""
+
+    def __init__(self, guild: discord.Guild, role_ids: list[int], on_select):
+        self.on_select = on_select
+        options = []
+        for role_id in role_ids:
+            role = guild.get_role(role_id)
+            label = role.name if role else f"رتبة محذوفة ({role_id})"
+            options.append(discord.SelectOption(label=label, value=str(role_id)))
+        super().__init__(placeholder="اختر الرتبة التي تريد المتابعة بها", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        role_id = int(self.values[0])
+        await self.on_select(interaction, role_id)
+
+
+class RoleChooserView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, role_ids: list[int], on_select):
+        super().__init__(timeout=120)
+        self.add_item(RoleChooserSelect(guild, role_ids, on_select))
+
+
+async def _resolve_role_or_prompt(interaction: discord.Interaction, on_resolved, prompt: str = None):
+    """يجلب رتب اشتراك المستخدم الفعالة:
+    - لا يوجد رتبة: يرسل رسالة الخطأ المعتادة.
+    - رتبة واحدة: ينفّذ on_resolved(interaction, role_id) مباشرة (نفس السلوك القديم بالضبط).
+    - أكثر من رتبة: يعرض قائمة اختيار، وعند الاختيار ينفّذ on_resolved(interaction, role_id).
+    """
+    role_ids = await asyncio.to_thread(db.get_owner_role_ids, interaction.guild.id, interaction.user.id)
+    if not role_ids:
+        await interaction.response.send_message(
+            "لا يوجد لديك أي اشتراك فعال حالياً. هذه الميزة مخصصة للمشتركين فقط.", ephemeral=True
+        )
+        return
+    if len(role_ids) == 1:
+        await on_resolved(interaction, role_ids[0])
+        return
+
+    await interaction.response.send_message(
+        prompt or "لديك أكثر من رتبة اشتراك فعالة في نفس الوقت. اختر الرتبة التي تريد المتابعة بها:",
+        view=RoleChooserView(interaction.guild, role_ids, on_resolved),
+        ephemeral=True
+    )
+
+
 class RolePanelView(discord.ui.View):
     """View دائم (timeout=None) يُسجَّل مرة واحدة بـ setup_hook حتى تبقى الأزرار
     تعمل بعد إعادة تشغيل البوت."""
@@ -70,23 +117,26 @@ class RolePanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
-    @discord.ui.button(label="إضافة عضو", style=discord.ButtonStyle.green, custom_id="role_panel_add")
+    @discord.ui.button(label="إضافة عضو", style=discord.ButtonStyle.gray, custom_id="role_panel_add")
     async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._add_member_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد إضافة عضو إليها:"
+        )
+
+    async def _add_member_action(self, interaction: discord.Interaction, role_id: int):
         view = discord.ui.View(timeout=120)
         view.add_item(AddMemberSelect(self.bot, role_id))
         await interaction.response.send_message("اختر العضو الذي تريد إضافته إلى رتبتك الخاصة:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="إزالة عضو", style=discord.ButtonStyle.red, custom_id="role_panel_remove")
+    @discord.ui.button(label="إزالة عضو", style=discord.ButtonStyle.gray, custom_id="role_panel_remove")
     async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._remove_member_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد إزالة عضو منها:"
+        )
 
+    async def _remove_member_action(self, interaction: discord.Interaction, role_id: int):
         shared_ids = await asyncio.to_thread(db.get_shared_members, interaction.user.id, interaction.guild.id, role_id)
         if not shared_ids:
             await interaction.response.send_message("لم تقم بإضافة أي عضو حتى الآن إلى رتبتك الخاصة", ephemeral=True)
@@ -102,31 +152,36 @@ class RolePanelView(discord.ui.View):
         view.add_item(RemoveMemberSelect(self.bot, role_id, options))
         await interaction.response.send_message("اختر العضو الذي تريد سحب رتبتك منه:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="تعديل الرتبة", style=discord.ButtonStyle.blurple, custom_id="role_panel_edit")
+    @discord.ui.button(label="تعديل الرتبة", style=discord.ButtonStyle.gray, custom_id="role_panel_edit")
     async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._edit_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد تعديلها:"
+        )
+
+    async def _edit_action(self, interaction: discord.Interaction, role_id: int):
         await interaction.response.send_modal(RoleEditModal(self.bot, role_id))
 
-    @discord.ui.button(label="إزالة الأيقونة", style=discord.ButtonStyle.red, custom_id="role_panel_remove_icon")
+    @discord.ui.button(label="إزالة الأيقونة", style=discord.ButtonStyle.gray, custom_id="role_panel_remove_icon")
     async def remove_icon_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._remove_icon_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد إزالة أيقونتها:"
+        )
+
+    async def _remove_icon_action(self, interaction: discord.Interaction, role_id: int):
         await interaction.response.defer(ephemeral=True)
         success, msg = await role_utils.do_remove_role_icon(self.bot, interaction.guild, interaction.user, role_id)
         await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="رفع صورة كأيقونة", style=discord.ButtonStyle.blurple, custom_id="role_panel_upload_icon")
+    @discord.ui.button(label="رفع صورة كأيقونة", style=discord.ButtonStyle.gray, custom_id="role_panel_upload_icon")
     async def upload_icon_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._upload_icon_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد رفع أيقونة لها:"
+        )
 
+    async def _upload_icon_action(self, interaction: discord.Interaction, role_id: int):
         await interaction.response.send_message(
             "أرسل الصورة التي تريد استخدامها كأيقونة لرتبتك خلال 60 ثانية في هذه القناة "
             "(PNG أو JPG أو GIF، بحجم أقل من 256 كيلوبايت).",
@@ -178,13 +233,14 @@ class RolePanelView(discord.ui.View):
         )
         await interaction.followup.send(result_msg, ephemeral=True)
 
-    @discord.ui.button(label="استخدام إيموجي كأيقونة", style=discord.ButtonStyle.blurple, custom_id="role_panel_emoji_icon")
+    @discord.ui.button(label="استخدام إيموجي كأيقونة", style=discord.ButtonStyle.gray, custom_id="role_panel_emoji_icon")
     async def emoji_icon_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
+        await _resolve_role_or_prompt(
+            interaction, self._emoji_icon_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد استخدام إيموجي لها:"
+        )
 
+    async def _emoji_icon_action(self, interaction: discord.Interaction, role_id: int):
         await interaction.response.send_message(
             "أرسل الإيموجي الذي تريد استخدامه كأيقونة لرتبتك خلال 60 ثانية في هذه القناة "
             "(إيموجي عادي أو إيموجي مخصص من هذا السيرفر).",
@@ -219,13 +275,22 @@ class RolePanelView(discord.ui.View):
 
     @discord.ui.button(label="مدة الاشتراك", style=discord.ButtonStyle.gray, custom_id="role_panel_duration")
     async def duration_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _resolve_role_or_prompt(
+            interaction, self._duration_action,
+            prompt="لديك أكثر من رتبة اشتراك فعالة. اختر الرتبة التي تريد معرفة مدتها:"
+        )
+
+    async def _duration_action(self, interaction: discord.Interaction, role_id: int):
         import datetime
-        info, error = await role_utils.get_owner_sub_info(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
+        rows = await asyncio.to_thread(db.get_owner_sub_info, interaction.guild.id, interaction.user.id)
+        match = next((row for row in rows if row[0] == role_id), None)
+        if not match:
+            await interaction.response.send_message(
+                "لا يوجد لديك أي اشتراك فعال حالياً. هذه الميزة مخصصة للمشتركين فقط.", ephemeral=True
+            )
             return
 
-        role_id, start_date_str, end_date_str = info
+        _, start_date_str, end_date_str = match
 
         if start_date_str:
             start_dt = datetime.datetime.strptime(start_date_str, '%Y-%m-%d %H:%M:%S')
@@ -278,23 +343,14 @@ class RolePanelCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"حدث خطأ أثناء نشر اللوحة: {e}", ephemeral=True)
 
-    @app_commands.command(name="remove_member", description="سحب رتبتك من عضو إضافي كنت قد أضفته سابقاً")
-    @app_commands.describe(member="العضو الذي تريد سحب رتبتك منه")
-    async def remove_member(self, interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.defer(ephemeral=True)
-        role_id, error = await role_utils.get_owner_single_role_id(interaction.guild.id, interaction.user.id)
-        if error:
-            await interaction.followup.send(error, ephemeral=True)
-            return
-        success, msg = await role_utils.do_remove_shared_member(
-            self.bot, interaction.guild, interaction.user, role_id, member.id
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-
     @send_role_panel.error
     async def send_role_panel_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.followup.send("هذا الأمر مخصص للإدارة فقط.", ephemeral=True)
+            message = "هذا الأمر مخصص للإدارة فقط."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
